@@ -186,7 +186,7 @@ def process_with_vllm(pdf_path: str, output_dir: str) -> List[Dict]:
         top_p=1,
         top_k=32,
         candidate_count=1,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
     )
     
     for i, image in enumerate(images, start=1):
