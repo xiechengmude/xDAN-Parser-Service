@@ -179,13 +179,14 @@ def process_with_vllm(pdf_path: str, output_dir: str) -> List[Dict]:
     images = convert_from_path(pdf_path)
     pages_content = []
     
-    # 初始化 Gemini Pro Vision 模型
-    model = GenerativeModel("gemini-1.5pro-vision")
+    # 初始化 Gemini 1.5 Pro 模型
+    model = GenerativeModel("gemini-1.5-pro-002")
     config = GenerationConfig(
         temperature=0.1,
         top_p=1,
         top_k=32,
         candidate_count=1,
+        max_output_tokens=2048,
     )
     
     for i, image in enumerate(images, start=1):
@@ -202,16 +203,26 @@ def process_with_vllm(pdf_path: str, output_dir: str) -> List[Dict]:
             
             # 使用 Gemini 模型分析图片
             prompt = """请分析这个图片并提取以下信息：
-1. 所有可见的文本内容
+1. 所有可见的文本内容（保持原始格式和顺序）
 2. 文档的结构和布局（标题、段落、列表等）
-3. 如果有表格，描述表格的内容
-4. 如果有图片，描述图片的内容
-请以结构化的方式返回这些信息。
+3. 如果有表格，详细描述表格的内容和结构
+4. 如果有图片，详细描述图片的视觉内容
+5. 如果有特殊格式（如粗体、斜体等），请标注出来
+
+请以结构化的方式返回这些信息，使用 Markdown 格式。
+对于表格内容，请尽可能保持原始的表格结构。
+严格遵循原文内容，不要做任何修改和总结概括。
 """
             
             response = model.generate_content(
                 [prompt, image_part],
                 generation_config=config,
+                safety_settings={
+                    "HARASSMENT": "block_none",
+                    "HATE_SPEECH": "block_none",
+                    "SEXUALLY_EXPLICIT": "block_none",
+                    "DANGEROUS_CONTENT": "block_none",
+                }
             )
             
             # 整理分析结果
