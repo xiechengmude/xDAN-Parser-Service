@@ -8,6 +8,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import io
+import sys
 
 # Vertex AI
 import vertexai
@@ -20,9 +21,14 @@ import pytesseract
 
 def setup_vertex_ai():
     """初始化 Vertex AI"""
-    project_id = "elated-bison-417808"
-    location = "us-central1"
-    vertexai.init(project=project_id, location=location)
+    try:
+        project_id = "elated-bison-417808"
+        location = "us-central1"
+        vertexai.init(project=project_id, location=location)
+        print(f"Vertex AI 初始化成功: project={project_id}, location={location}")
+    except Exception as e:
+        print(f"Vertex AI 初始化失败: {str(e)}")
+        raise
 
 def process_with_pdf2image(pdf_path: str, output_dir: str) -> List[Dict]:
     """
@@ -100,18 +106,26 @@ async def process_single_page(model: GenerativeModel, page_num: int, image: PILI
     Returns:
         Dict: 页面处理结果
     """
+    print(f"\n开始处理第 {page_num} 页...")
     try:
         # 保存图片
         image_path = os.path.join(output_dir, f"page_{page_num}.png")
         image.save(image_path, format="PNG")
+        print(f"第 {page_num} 页图片已保存到: {image_path}")
         
         # 将图片转换为字节流
         img_byte_arr = io.BytesIO()
         image.save(img_byte_arr, format='PNG')
         img_byte_arr = img_byte_arr.getvalue()
+        print(f"第 {page_num} 页图片已转换为字节流")
         
         # 转换为 Vertex AI Image 对象
-        vertex_image = VertexImage.from_bytes(img_byte_arr)
+        try:
+            vertex_image = VertexImage.from_bytes(img_byte_arr)
+            print(f"第 {page_num} 页已转换为 Vertex AI Image 对象")
+        except Exception as e:
+            print(f"第 {page_num} 页转换为 Vertex AI Image 对象失败: {str(e)}")
+            raise
         
         # 构建提示词
         prompt = """请识别并提取图片中的所有文本内容。要求：
@@ -122,28 +136,33 @@ async def process_single_page(model: GenerativeModel, page_num: int, image: PILI
 5. 使用markdown格式输出"""
         
         try:
+            print(f"第 {page_num} 页开始调用 Gemini API...")
             # 生成响应
             responses = model.generate_content(
                 [prompt, vertex_image],
                 generation_config=generation_config,
                 safety_settings=safety_settings,
             )
+            print(f"第 {page_num} 页 Gemini API 调用成功")
             
             # 处理响应
             page_content = {
-                "page_number": page_num,  
+                "page_number": page_num,
                 "content": responses.text,
                 "image_path": image_path
             }
-            
+            print(f"第 {page_num} 页处理完成")
             return page_content
             
         except Exception as e:
-            if "rate limit exceeded" in str(e).lower():
+            error_msg = str(e).lower()
+            if "rate limit exceeded" in error_msg:
                 # 如果是速率限制错误，等待一段时间后重试
-                print(f"第 {page_num} 页处理遇到速率限制，等待60秒后重试...")
-                await asyncio.sleep(60)
+                wait_time = 65  # 增加等待时间到65秒
+                print(f"第 {page_num} 页处理遇到速率限制，等待{wait_time}秒后重试...")
+                await asyncio.sleep(wait_time)
                 # 重试一次
+                print(f"第 {page_num} 页开始重试...")
                 responses = model.generate_content(
                     [prompt, vertex_image],
                     generation_config=generation_config,
@@ -154,20 +173,22 @@ async def process_single_page(model: GenerativeModel, page_num: int, image: PILI
                     "content": responses.text,
                     "image_path": image_path
                 }
+                print(f"第 {page_num} 页重试成功")
                 return page_content
             else:
-                raise e
+                print(f"第 {page_num} 页处理失败: {str(e)}")
+                raise
             
     except Exception as e:
         print(f"处理第 {page_num} 页时出错: {str(e)}")
         return {
-            "page_number": page_num,  
+            "page_number": page_num,
             "content": f"处理出错: {str(e)}",
             "image_path": image_path if 'image_path' in locals() else None,
             "error": str(e)
         }
 
-async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int = 5) -> List[Dict]:
+async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int = 3) -> List[Dict]:
     """
     将 PDF 转换为图片并使用 Vertex AI Vision 进行分析
     
@@ -179,18 +200,24 @@ async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int 
     Returns:
         List[Dict]: 每页的处理结果
     """
+    print("\n=== 开始 VLLM 处理 ===")
+    
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
+    print(f"输出目录已创建: {output_dir}")
     
     # 将PDF转换为图片
+    print("开始转换 PDF 为图片...")
     images = convert_from_path(pdf_path)
     total_pages = len(images)
     print(f"PDF共有 {total_pages} 页")
     
     # 初始化 Vertex AI
+    print("初始化 Vertex AI...")
     setup_vertex_ai()
     
     # 初始化 Gemini Pro Vision 模型
+    print("初始化 Gemini Pro Vision 模型...")
     model = GenerativeModel("gemini-1.5-pro-002")
     
     # 设置生成配置
@@ -200,6 +227,7 @@ async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int 
         top_k=32,
         max_output_tokens=2048,
     )
+    print("生成配置已设置")
     
     # 设置安全设置
     safety_settings = [
@@ -208,10 +236,12 @@ async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int 
         SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
         SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
     ]
+    print("安全设置已配置")
     
     # 创建任务列表
     tasks = []
     semaphore = asyncio.Semaphore(max_concurrent)
+    print(f"并发限制设置为: {max_concurrent}")
     
     async def process_with_semaphore(page_num: int, image: PILImage.Image) -> Dict:
         async with semaphore:
@@ -221,20 +251,25 @@ async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int 
             )
     
     # 创建所有任务
+    print("创建处理任务...")
     for i, image in enumerate(images, start=1):
         task = asyncio.create_task(process_with_semaphore(i, image))
         tasks.append(task)
+    print(f"已创建 {len(tasks)} 个任务")
     
     # 使用tqdm显示进度
     pages_content = []
-    with tqdm(total=total_pages, desc="处理页面") as pbar:
+    print("\n开始处理页面...")
+    with tqdm(total=total_pages, desc="处理页面", file=sys.stdout) as pbar:
         for coro in asyncio.as_completed(tasks):
             result = await coro
             pages_content.append(result)
             pbar.update(1)
+            print(f"已完成 {len(pages_content)}/{total_pages} 页")
     
     # 按页码排序结果
     pages_content.sort(key=lambda x: x['page_number'])
+    print("\nVLLM 处理完成")
     
     return pages_content
 
