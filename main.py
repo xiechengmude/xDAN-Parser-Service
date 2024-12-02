@@ -1,22 +1,18 @@
 import os
 import json
 import argparse
+import asyncio
 from typing import Dict, List, Optional
 from pathlib import Path
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
 # Vertex AI
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, GenerationConfig, Image as VertexImage, SafetySetting
 
 # PDF处理
-from unstructured.partition.pdf import partition_pdf
-from unstructured.partition.text import partition_text
-from unstructured.documents.elements import (
-    Text, Title, NarrativeText, ListItem, Table, Image
-)
-
-# 图像处理
 from pdf2image import convert_from_path
 from PIL import Image as PILImage
 import pytesseract
@@ -26,79 +22,6 @@ def setup_vertex_ai():
     project_id = "elated-bison-417808"
     location = "us-central1"
     vertexai.init(project=project_id, location=location)
-
-def process_with_unstructured(pdf_path: str) -> List[Dict]:
-    """
-    使用 unstructured 处理 PDF，保留布局信息
-    
-    Args:
-        pdf_path: PDF文件路径
-    
-    Returns:
-        List[Dict]: 每页的结构化内容
-    """
-    elements = partition_pdf(
-        pdf_path,
-        include_page_breaks=True,
-        include_metadata=True,
-        strategy="hi_res"
-    )
-    
-    pages_content = []
-    current_page = []
-    current_page_num = 1
-    
-    for element in elements:
-        # 检查是否是新页面
-        if hasattr(element, 'metadata'):
-            page_num = element.metadata.get('page_number', current_page_num)
-            if page_num > current_page_num and current_page:
-                pages_content.append({
-                    'page_number': current_page_num,
-                    'content': current_page
-                })
-                current_page = []
-                current_page_num = page_num
-        
-        # 处理不同类型的元素
-        element_data = {
-            'type': element.__class__.__name__,
-            'text': str(element),
-            'metadata': {}
-        }
-        
-        # 提取元数据
-        if hasattr(element, 'metadata'):
-            element_data['metadata'] = {
-                'coordinates': element.metadata.get('coordinates', None),
-                'page_number': element.metadata.get('page_number', None),
-                'font_info': element.metadata.get('font_info', None)
-            }
-        
-        # 特殊处理表格
-        if isinstance(element, Table):
-            element_data['table_data'] = {
-                'rows': len(element.metadata.get('text_as_html', '').split('</tr>')),
-                'html': element.metadata.get('text_as_html', '')
-            }
-        
-        # 特殊处理图片
-        if isinstance(element, Image):
-            element_data['image_data'] = {
-                'size': element.metadata.get('image_size', None),
-                'format': element.metadata.get('image_format', None)
-            }
-        
-        current_page.append(element_data)
-    
-    # 添加最后一页
-    if current_page:
-        pages_content.append({
-            'page_number': current_page_num,
-            'content': current_page
-        })
-    
-    return pages_content
 
 def process_with_pdf2image(pdf_path: str, output_dir: str) -> List[Dict]:
     """
@@ -160,95 +83,132 @@ def process_with_pdf2image(pdf_path: str, output_dir: str) -> List[Dict]:
     
     return pages_content
 
-def process_with_vllm(pdf_path: str, output_dir: str) -> List[Dict]:
+async def process_single_page(model: GenerativeModel, page_num: int, image: PILImage.Image, output_dir: str, 
+                            generation_config: GenerationConfig, safety_settings: List[SafetySetting]) -> Dict:
+    """
+    异步处理单个页面
+    
+    Args:
+        model: Gemini 模型实例
+        page_num: 页码
+        image: PIL图像对象
+        output_dir: 输出目录
+        generation_config: 生成配置
+        safety_settings: 安全设置
+    
+    Returns:
+        Dict: 页面处理结果
+    """
+    # 保存图片
+    image_path = os.path.join(output_dir, f"page_{page_num}.png")
+    image.save(image_path)
+    
+    # 读取图片用于 Vertex AI
+    with PILImage.open(image_path) as img:
+        # 转换为 Vertex AI Image 对象
+        vertex_image = VertexImage.from_bytes(img.tobytes())
+    
+    # 构建提示词
+    prompt = """请识别并提取图片中的所有文本内容。要求：
+1. 严格遵循原文内容，不要做任何修改和总结概括
+2. 保持原文的段落和布局结构
+3. 如果有表格，请保持表格的格式
+4. 如果有图片，请标注[图片]位置
+5. 使用markdown格式输出"""
+    
+    try:
+        # 生成响应
+        responses = model.generate_content(
+            [prompt, vertex_image],
+            generation_config=generation_config,
+            safety_settings=safety_settings,
+        )
+        
+        # 处理响应
+        page_content = {
+            "page_num": page_num,
+            "content": responses.text,
+            "image_path": image_path
+        }
+        
+        return page_content
+    except Exception as e:
+        print(f"处理第 {page_num} 页时出错: {str(e)}")
+        return {
+            "page_num": page_num,
+            "content": f"处理出错: {str(e)}",
+            "image_path": image_path,
+            "error": str(e)
+        }
+
+async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int = 5) -> List[Dict]:
     """
     将 PDF 转换为图片并使用 Vertex AI Vision 进行分析
     
     Args:
         pdf_path: PDF文件路径
         output_dir: 输出目录
+        max_concurrent: 最大并发数
     
     Returns:
         List[Dict]: 每页的处理结果
     """
-    # 创建临时目录存储图片
-    images_dir = os.path.join(output_dir, 'images')
-    os.makedirs(images_dir, exist_ok=True)
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
     
-    # 转换PDF为图片
+    # 将PDF转换为图片
     images = convert_from_path(pdf_path)
-    pages_content = []
+    total_pages = len(images)
+    print(f"PDF共有 {total_pages} 页")
     
-    # 初始化 Gemini 1.5 Pro 模型
+    # 初始化 Vertex AI
+    setup_vertex_ai()
+    
+    # 初始化 Gemini Pro Vision 模型
     model = GenerativeModel("gemini-1.5-pro-002")
-    config = GenerationConfig(
+    
+    # 设置生成配置
+    generation_config = GenerationConfig(
         temperature=0.1,
         top_p=1,
         top_k=32,
-        candidate_count=1,
-        max_output_tokens=4096,
+        max_output_tokens=2048,
     )
     
-    for i, image in enumerate(images, start=1):
-        # 保存图片
-        image_path = os.path.join(images_dir, f'page_{i}.png')
-        image.save(image_path, 'PNG')
-        
-        # 获取图片尺寸
-        width, height = image.size
-        
-        try:
-            # 读取图片用于 Vertex AI
-            image_part = Part.from_image(VertexImage.load_from_file(image_path))
-            
-            # 使用 Gemini 模型分析图片
-            prompt = """请分析这个图片并提取以下信息：
-1. 所有可见的文本内容（保持原始格式和顺序）
-2. 文档的结构和布局（标题、段落、列表等）
-3. 如果有表格，详细描述表格的内容和结构
-4. 如果有图片，详细描述图片的视觉内容
-5. 如果有特殊格式（如粗体、斜体等），请标注出来
-
-请以结构化的方式返回这些信息，使用 Markdown 格式。
-对于表格内容，请尽可能保持原始的表格结构。
-严格遵循原文内容，不要做任何修改和总结概括。
-"""
-            
-            response = model.generate_content(
-                [prompt, image_part],
-                generation_config=config,
-                safety_settings={
-                    "HARASSMENT": "block_none",
-                    "HATE_SPEECH": "block_none",
-                    "SEXUALLY_EXPLICIT": "block_none",
-                    "DANGEROUS_CONTENT": "block_none",
-                }
+    # 设置安全设置
+    safety_settings = [
+        SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"),
+        SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"),
+        SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"),
+        SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+    ]
+    
+    # 创建任务列表
+    tasks = []
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(page_num: int, image: PILImage.Image) -> Dict:
+        async with semaphore:
+            return await process_single_page(
+                model, page_num, image, output_dir, 
+                generation_config, safety_settings
             )
-            
-            # 整理分析结果
-            page_content = {
-                'page_number': i,
-                'image_path': image_path,
-                'size': {'width': width, 'height': height},
-                'gemini_analysis': {
-                    'text': response.text,
-                    'safety_ratings': [
-                        {
-                            'category': rating.category,
-                            'probability': rating.probability
-                        }
-                        for rating in response.safety_ratings
-                    ] if hasattr(response, 'safety_ratings') else []
-                }
-            }
-            
-            pages_content.append(page_content)
-            print(f"已完成第 {i} 页的分析")
-            
-        except Exception as e:
-            print(f"处理第 {i} 页时出错: {e}")
-            # 继续处理下一页
-            continue
+    
+    # 创建所有任务
+    for i, image in enumerate(images, start=1):
+        task = asyncio.create_task(process_with_semaphore(i, image))
+        tasks.append(task)
+    
+    # 使用tqdm显示进度
+    pages_content = []
+    with tqdm(total=total_pages, desc="处理页面") as pbar:
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            pages_content.append(result)
+            pbar.update(1)
+    
+    # 按页码排序结果
+    pages_content.sort(key=lambda x: x['page_num'])
     
     return pages_content
 
@@ -258,30 +218,14 @@ def create_markdown_output(content: Dict, method: str) -> str:
     
     Args:
         content: 页面内容
-        method: 处理方法 ('unstructured' 或 'pdf2image' 或 'vllm')
+        method: 处理方法 ('pdf2image' 或 'vllm')
     
     Returns:
         str: Markdown格式的内容
     """
     markdown = f"# 第 {content['page_number']} 页\n\n"
     
-    if method == 'unstructured':
-        for element in content['content']:
-            element_type = element['type']
-            if element_type in ['Text', 'NarrativeText']:
-                markdown += f"{element['text']}\n\n"
-            elif element_type == 'Title':
-                markdown += f"## {element['text']}\n\n"
-            elif element_type == 'Table':
-                markdown += "### 表格\n```json\n"
-                markdown += json.dumps(element['table_data'], ensure_ascii=False, indent=2)
-                markdown += "\n```\n\n"
-            elif element_type == 'Image':
-                markdown += "### 图片\n```json\n"
-                markdown += json.dumps(element['image_data'], ensure_ascii=False, indent=2)
-                markdown += "\n```\n\n"
-    
-    elif method == 'pdf2image':
+    if method == 'pdf2image':
         markdown += f"![页面图片]({content['image_path']})\n\n"
         markdown += "## 文本内容\n\n"
         for elem in content['text_elements']:
@@ -292,72 +236,70 @@ def create_markdown_output(content: Dict, method: str) -> str:
     else:  # vllm
         markdown += f"![页面图片]({content['image_path']})\n\n"
         markdown += "## Gemini 分析结果\n\n"
-        markdown += content['gemini_analysis']['text']
+        markdown += content['content']
         markdown += "\n\n"
-        
-        if content['gemini_analysis']['safety_ratings']:
-            markdown += "### 安全评级\n\n"
-            for rating in content['gemini_analysis']['safety_ratings']:
-                markdown += f"- {rating['category']}: {rating['probability']}\n"
-            markdown += "\n"
     
     return markdown
 
-def process_pdf(pdf_path: str, output_dir: str = "output", method: str = "unstructured") -> None:
+async def async_process_pdf(pdf_path: str, output_dir: str = "output", method: str = "pdf2image", max_concurrent: int = 5) -> None:
     """
-    处理PDF文件
+    异步处理PDF文件
     
     Args:
         pdf_path: PDF文件路径
         output_dir: 输出目录路径
-        method: 处理方法 ('unstructured' 或 'pdf2image' 或 'vllm')
+        method: 处理方法 ('pdf2image' 或 'vllm')
+        max_concurrent: 最大并发数
     """
     try:
         os.makedirs(output_dir, exist_ok=True)
         
         # 根据选择的方法处理PDF
-        if method == "unstructured":
-            pages_content = process_with_unstructured(pdf_path)
-        elif method == "pdf2image":
+        if method == "pdf2image":
             pages_content = process_with_pdf2image(pdf_path, output_dir)
         else:  # vllm
-            pages_content = process_with_vllm(pdf_path, output_dir)
+            pages_content = await process_with_vllm(pdf_path, output_dir, max_concurrent)
         
         # 处理每一页
         for page_content in pages_content:
-            page_num = page_content['page_number']
+            page_num = page_content['page_num']
             
             # 生成Markdown
             markdown_content = create_markdown_output(page_content, method)
-            output_file = os.path.join(output_dir, f"page_{page_num}.md")
-            with open(output_file, 'w', encoding='utf-8') as md_file:
-                md_file.write(markdown_content)
-            print(f"已保存Markdown到: {output_file}")
             
-            # 保存JSON
-            json_file = os.path.join(output_dir, f"page_{page_num}.json")
+            # 保存Markdown文件
+            markdown_file = os.path.join(output_dir, f'page_{page_num}.md')
+            with open(markdown_file, 'w', encoding='utf-8') as f:
+                f.write(markdown_content)
+            
+            # 保存JSON文件
+            json_file = os.path.join(output_dir, f'page_{page_num}.json')
             with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(page_content, f, ensure_ascii=False, indent=2)
-            print(f"已保存JSON到: {json_file}")
-
+        
+        print(f"处理完成。输出目录: {output_dir}")
+        
     except Exception as e:
-        print(f"处理PDF文件时出错: {e}")
+        print(f"处理PDF时出错: {e}")
         raise
 
 def main():
     parser = argparse.ArgumentParser(description='PDF文档处理工具')
     parser.add_argument('--pdf_path', default='docs/pdf/example.pdf', help='PDF文件路径')
     parser.add_argument('--output_dir', default='output', help='输出目录路径')
-    parser.add_argument('--method', choices=['unstructured', 'pdf2image', 'vllm'], 
-                       default='unstructured', help='PDF处理方法')
+    parser.add_argument('--method', choices=['pdf2image', 'vllm'], 
+                       default='pdf2image', help='PDF处理方法')
+    parser.add_argument('--max_concurrent', type=int, default=5, 
+                       help='最大并发数（仅适用于vllm方法）')
     args = parser.parse_args()
     
-    # 初始化 Vertex AI
-    setup_vertex_ai()
-    
-    # 处理PDF
-    process_pdf(args.pdf_path, args.output_dir, args.method)
-    print("\n处理完成！")
+    # 运行异步主函数
+    asyncio.run(async_process_pdf(
+        args.pdf_path, 
+        args.output_dir, 
+        args.method,
+        args.max_concurrent
+    ))
 
 if __name__ == "__main__":
     main()
