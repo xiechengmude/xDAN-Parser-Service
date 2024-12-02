@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+import io
 
 # Vertex AI
 import vertexai
@@ -99,45 +100,70 @@ async def process_single_page(model: GenerativeModel, page_num: int, image: PILI
     Returns:
         Dict: 页面处理结果
     """
-    # 保存图片
-    image_path = os.path.join(output_dir, f"page_{page_num}.png")
-    image.save(image_path)
-    
-    # 读取图片用于 Vertex AI
-    with PILImage.open(image_path) as img:
+    try:
+        # 保存图片
+        image_path = os.path.join(output_dir, f"page_{page_num}.png")
+        image.save(image_path, format="PNG")
+        
+        # 将图片转换为字节流
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='PNG')
+        img_byte_arr = img_byte_arr.getvalue()
+        
         # 转换为 Vertex AI Image 对象
-        vertex_image = VertexImage.from_bytes(img.tobytes())
-    
-    # 构建提示词
-    prompt = """请识别并提取图片中的所有文本内容。要求：
+        vertex_image = VertexImage.from_bytes(img_byte_arr)
+        
+        # 构建提示词
+        prompt = """请识别并提取图片中的所有文本内容。要求：
 1. 严格遵循原文内容，不要做任何修改和总结概括
 2. 保持原文的段落和布局结构
 3. 如果有表格，请保持表格的格式
 4. 如果有图片，请标注[图片]位置
 5. 使用markdown格式输出"""
-    
-    try:
-        # 生成响应
-        responses = model.generate_content(
-            [prompt, vertex_image],
-            generation_config=generation_config,
-            safety_settings=safety_settings,
-        )
         
-        # 处理响应
-        page_content = {
-            "page_num": page_num,
-            "content": responses.text,
-            "image_path": image_path
-        }
-        
-        return page_content
+        try:
+            # 生成响应
+            responses = model.generate_content(
+                [prompt, vertex_image],
+                generation_config=generation_config,
+                safety_settings=safety_settings,
+            )
+            
+            # 处理响应
+            page_content = {
+                "page_number": page_num,  
+                "content": responses.text,
+                "image_path": image_path
+            }
+            
+            return page_content
+            
+        except Exception as e:
+            if "rate limit exceeded" in str(e).lower():
+                # 如果是速率限制错误，等待一段时间后重试
+                print(f"第 {page_num} 页处理遇到速率限制，等待60秒后重试...")
+                await asyncio.sleep(60)
+                # 重试一次
+                responses = model.generate_content(
+                    [prompt, vertex_image],
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
+                )
+                page_content = {
+                    "page_number": page_num,
+                    "content": responses.text,
+                    "image_path": image_path
+                }
+                return page_content
+            else:
+                raise e
+            
     except Exception as e:
         print(f"处理第 {page_num} 页时出错: {str(e)}")
         return {
-            "page_num": page_num,
+            "page_number": page_num,  
             "content": f"处理出错: {str(e)}",
-            "image_path": image_path,
+            "image_path": image_path if 'image_path' in locals() else None,
             "error": str(e)
         }
 
@@ -208,7 +234,7 @@ async def process_with_vllm(pdf_path: str, output_dir: str, max_concurrent: int 
             pbar.update(1)
     
     # 按页码排序结果
-    pages_content.sort(key=lambda x: x['page_num'])
+    pages_content.sort(key=lambda x: x['page_number'])
     
     return pages_content
 
@@ -223,21 +249,23 @@ def create_markdown_output(content: Dict, method: str) -> str:
     Returns:
         str: Markdown格式的内容
     """
-    markdown = f"# 第 {content['page_number']} 页\n\n"
+    page_num = content.get('page_number', content.get('page_num', 0))
+    markdown = f"# 第 {page_num} 页\n\n"
     
     if method == 'pdf2image':
         markdown += f"![页面图片]({content['image_path']})\n\n"
         markdown += "## 文本内容\n\n"
         for elem in content['text_elements']:
-            pos = elem['position']
-            markdown += f"[位置: ({pos['x']}, {pos['y']})] {elem['text']}\n"
-        markdown += "\n"
-    
+            markdown += f"{elem}\n\n"
+            
     else:  # vllm
-        markdown += f"![页面图片]({content['image_path']})\n\n"
-        markdown += "## Gemini 分析结果\n\n"
-        markdown += content['content']
-        markdown += "\n\n"
+        if 'error' in content:
+            markdown += f"**错误信息**\n\n{content['error']}\n\n"
+        else:
+            markdown += f"![页面图片]({content['image_path']})\n\n"
+            markdown += "## 内容\n\n"
+            markdown += content['content']
+            markdown += "\n\n"
     
     return markdown
 
@@ -262,7 +290,7 @@ async def async_process_pdf(pdf_path: str, output_dir: str = "output", method: s
         
         # 处理每一页
         for page_content in pages_content:
-            page_num = page_content['page_num']
+            page_num = page_content['page_number']
             
             # 生成Markdown
             markdown_content = create_markdown_output(page_content, method)
