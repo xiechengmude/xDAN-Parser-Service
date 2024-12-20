@@ -1,18 +1,28 @@
-import os
-from typing import Optional, Dict
-from fastapi import FastAPI, File, UploadFile, HTTPException, Path
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import File, UploadFile, HTTPException, Path
 from fastapi.responses import JSONResponse, FileResponse
 import asyncio
 from pathlib import Path
 
 from .models import TaskResponse, TaskResult, TaskStatus
 from .services import PDFProcessingService
+from .routes import pdf, pptx
 
-app = FastAPI(
-    title="PDF Processing API",
-    description="API for processing PDF documents using Vertex AI",
-    version="1.0.0"
+app = FastAPI(title="Document Processing API")
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+# 注册路由
+app.include_router(pdf.router)
+app.include_router(pptx.router)
 
 # 初始化服务
 pdf_service = PDFProcessingService()
@@ -137,3 +147,14 @@ async def analyze_page(task_id: str, page: int):
     
     result = await pdf_service.analyze_image(task_id, image_path, page - 1)
     return result
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to Document Processing API",
+        "version": "1.0.0",
+        "endpoints": {
+            "pdf": "/pdf/...",
+            "pptx": "/pptx/..."
+        }
+    }
