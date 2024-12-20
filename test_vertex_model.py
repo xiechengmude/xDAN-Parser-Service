@@ -21,7 +21,7 @@ class TestVertexModelParsing(unittest.TestCase):
         self.output_dir = "test_output/vertex_test"
         self.project_id = "elated-bison-417808"
         self.location = "us-central1"
-        self.model_name = "gemini-1.5-flash-002"
+        self.model_name = "gemini-1.5-pro-002"
         self.max_retries = 5  # 增加重试次数
         self.initial_retry_delay = 2  # 增加初始重试延迟
         self.max_concurrent = 3  # 限制并发数
