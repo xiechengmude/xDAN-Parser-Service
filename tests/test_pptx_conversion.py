@@ -36,7 +36,7 @@ def pptx_service(test_dirs):
 @pytest.fixture
 def test_pptx():
     """获取测试用的 PPT 文件路径"""
-    pptx_path = os.path.join(project_root, "docs", "ppt", "test.pptx")
+    pptx_path = "/workspace/xDAN-Parser-Service/docs/ppt/test.pptx"
     if not os.path.exists(pptx_path):
         raise FileNotFoundError(f"测试 PPT 文件不存在: {pptx_path}")
     return pptx_path
@@ -84,5 +84,5 @@ if __name__ == "__main__":
             upload_dir="test_outputs/uploads",
             output_dir="test_outputs/slides"
         ),
-        os.path.join(project_root, "docs", "ppt", "test.pptx")
+        "/workspace/xDAN-Parser-Service/docs/ppt/test.pptx"
     ))
